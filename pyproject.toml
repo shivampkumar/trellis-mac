@@ -1,0 +1,24 @@
+[project]
+name = "trellis-apple"
+version = "0.1.0"
+description = "TRELLIS.2 image-to-3D generation for Apple Silicon"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.1",
+    "torchvision",
+    "torchaudio",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "safetensors",
+    "pillow",
+    "numpy",
+    "trimesh",
+    "scipy",
+    "tqdm",
+]
+
+[project.scripts]
+trellis-generate = "generate:main"
