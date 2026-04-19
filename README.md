@@ -21,8 +21,15 @@ Output includes vertex-colored OBJ and GLB files ready for use in 3D application
 
 ```bash
 # Clone this repo
-git clone https://github.com/user/trellis-apple.git
-cd trellis-apple
+git clone https://github.com/shivampkumar/trellis-mac.git
+cd trellis-mac
+
+# Log into HuggingFace (needed for gated model weights)
+hf auth login
+
+# Request access to these gated models (usually instant approval):
+#   https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
+#   https://huggingface.co/briaai/RMBG-2.0
 
 # Run setup (creates venv, installs deps, clones & patches TRELLIS.2)
 bash setup.sh

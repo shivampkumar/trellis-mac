@@ -177,6 +177,13 @@ def patch_image_feature_extractor():
         "        self.model.cpu()",
     )
 
+    # Fix DINOv3 model.layer -> model.model.layer (HuggingFace structure)
+    src = src.replace(
+        "        for i, layer_module in enumerate(self.model.layer):",
+        "        layers = self.model.model.layer if hasattr(self.model, 'model') and hasattr(self.model.model, 'layer') else self.model.layer\n"
+        "        for i, layer_module in enumerate(layers):",
+    )
+
     write_file(path, src)
 
 
