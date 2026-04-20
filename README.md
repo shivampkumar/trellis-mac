@@ -10,7 +10,15 @@ Generates **400K+ vertex meshes** from single images in **~3.5 minutes on M4 Pro
 
 Output includes textured OBJ and GLB files with PBR materials, ready for use in 3D applications.
 
-Examples coming soon.
+### Example (nearest-neighbor sampling, trilinear interpolation WIP)
+
+**Input** &rarr; **Generated 3D mesh (424K vertices, 858K triangles)**
+
+<p>
+<img src="assets/shoe_input.png" width="200">
+<img src="assets/shoe_front.png" width="280">
+<img src="assets/shoe_side.png" width="280">
+</p>
 
 ## Requirements
 
