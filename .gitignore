@@ -8,3 +8,5 @@ stubs/
 *.glb
 *.gltf
 .DS_Store
+progress-assets/
+PROGRESS.md

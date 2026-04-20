@@ -54,11 +54,11 @@ if [ "${SKIP_METAL:-0}" != "1" ]; then
     $PIP_NB git+https://github.com/pedronaugusto/mtlbvh.git      || echo "  mtlbvh install failed — continuing without Metal BVH"
     $PIP_NB git+https://github.com/pedronaugusto/mtldiffrast.git || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
     $PIP_NB git+https://github.com/pedronaugusto/mtlmesh.git     || echo "  mtlmesh install failed — continuing without Metal mesh ops"
-    # Deliberately NOT installing mtlgemm (flex_gemm). Its presence in the
-    # import graph slows the PyTorch MPS diffusion path ~10x end-to-end even
-    # when SPARSE_CONV_BACKEND=none (confirmed via fresh-install benchmarks).
-    # generate.py monkey-patches the one function in o_voxel.postprocess that
-    # depends on it — the fallback works on MPS with no measurable cost.
+    # mtlgemm provides flex_gemm.ops.grid_sample. The Metal baker in
+    # o_voxel.postprocess prefers this over a torch.nn.functional.grid_sample
+    # fallback, and the flex_gemm sparse sampling produces noticeably cleaner
+    # texture baking (no concentric ring artifacts on curved surfaces).
+    $PIP_NB git+https://github.com/pedronaugusto/mtlgemm.git     || echo "  mtlgemm install failed — baker will use a lower-quality torch.nn.functional.grid_sample fallback"
     # Pedro Naugusto's o_voxel CPU fork — exposes o_voxel.postprocess.to_glb
     # which wraps the Metal stack. Install last so its deps already present.
     $PIP_NB "git+https://github.com/pedronaugusto/trellis2-apple.git#subdirectory=o-voxel" \

@@ -113,24 +113,24 @@ Additionally, all hardcoded `.cuda()` calls throughout the codebase were patched
 
 ## Performance
 
-Benchmarks on M4 Pro (24GB), pipeline type `512`, Metal texture baker enabled, model weights cached. Numbers below are from a fresh-install end-to-end run (`/usr/bin/time -h python generate.py shoe_input.png`):
+Benchmarks on M4 Pro (24GB), pipeline type `512`, full Metal stack installed, weights cached. Numbers below are from a fresh-install end-to-end run (`/usr/bin/time -h python generate.py shoe_input.png`). Important: these numbers assume a **cool machine**. M4 Pro throttles aggressively under sustained load, and I've measured the same run taking 6–10× longer when the CPU had already been pinned for an hour before I started.
 
 | Stage | Time |
 |-------|------|
-| Pipeline load (first call) | ~110s |
+| Pipeline load (first call after `python generate.py …`) | ~105s |
 | Sparse structure sampling (12 steps) | ~80s |
 | Shape SLat sampling (12 steps) | ~25s |
-| Texture SLat sampling (12 steps) | ~15s |
-| Mesh decoding | ~85s |
-| `fast_simplification` (858K → 200K faces) | ~1s |
+| Texture SLat sampling (12 steps) | ~12s |
+| Mesh decoding + `fast_simplification` (858K → 200K faces) | ~100s |
 | Texture bake (Metal, 1024²) | ~11s |
-| **Total wall-clock** | **~5m 45s** |
+| **Total wall-clock (cold start)** | **~5m 40s** |
+| Generation + bake only (excluding pipeline load) | ~3m 52s |
 
 Memory usage peaks at around 18GB unified memory during generation.
 
-First-ever run adds ~15GB of HuggingFace weight downloads (TRELLIS.2, DINOv3, RMBG-2.0) — network-bound, not included above.
+First-ever run adds ~15GB of HuggingFace weight downloads (TRELLIS.2, DINOv3, RMBG-2.0) — network-bound, not included above. The pipeline load time is dominated by deserializing those weights from disk; if you batch multiple images in one Python process you pay load once.
 
-With `SKIP_METAL=1` (pure-Python KDTree baker), the texture bake takes ~15s instead of ~11s, and coverage near UV chart boundaries is slightly softer. All other timings are unchanged.
+With `SKIP_METAL=1` (pure-Python KDTree baker) the texture bake takes ~15s instead of ~11s and coverage near UV chart boundaries is slightly softer. Without the `mtlgemm` Python package specifically, the Metal baker falls back to a `torch.nn.functional.grid_sample` call that can leave mild ring artifacts on curved surfaces; installing `mtlgemm` (done automatically by `setup.sh`) gets rid of them.
 
 ## Limitations
 
@@ -139,13 +139,11 @@ With `SKIP_METAL=1` (pure-Python KDTree baker), the texture bake takes ~15s inst
 - **Pre-simplified before texture bake**: The mesh is decimated from ~800K to ~200K faces before Metal BVH construction to avoid builder instability. If you need the full-resolution mesh, export it via the OBJ output (which is written before simplification).
 - **No training support**: Inference only.
 
-### A note on `mtlgemm` / `flex_gemm`
+### On `mtlgemm` / `flex_gemm` and thermal throttling
 
-Pedro Naugusto ships a Metal port of `flex_gemm` (at [mtlgemm](https://github.com/pedronaugusto/mtlgemm)). We deliberately **do not** install it in `setup.sh` because its mere presence in the import graph slows the MPS diffusion hot path by ~10× on our benchmark (3.5 min → 36 min) even when `SPARSE_CONV_BACKEND=none`. The only place we actually need `flex_gemm` is a single `grid_sample_3d` call inside `o_voxel.postprocess.to_glb`; `generate.py` monkey-patches that one function with a `torch.nn.functional.grid_sample` fallback so the Metal baker runs without it. Sampled attribute quality is very close; a handful of out-of-distribution voxels show up slightly darker. If you want the original behavior and can accept the slowdown, install `mtlgemm` manually:
+`setup.sh` installs `mtlgemm` as part of the Metal stack. The baker uses it for sparse attribute sampling inside `o_voxel.postprocess.to_glb`; without it, `generate.py` monkey-patches the one call site with a `torch.nn.functional.grid_sample` fallback, which is correct but leaves mild ring artifacts on curved surfaces. With `mtlgemm` the output matches the CUDA reference implementation.
 
-```bash
-uv pip install --no-build-isolation git+https://github.com/pedronaugusto/mtlgemm.git
-```
+One thing that burned me during testing: after the M4 Pro had been doing heavy compute for a few hours, the same pipeline slowed from ~3.5 min generation to ~36 min purely from thermal throttling — nothing in the code path changed. If you see unusually slow runs, let the machine cool for a few minutes and retry before blaming the code.
 
 ## License
 
