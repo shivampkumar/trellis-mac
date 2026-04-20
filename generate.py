@@ -11,9 +11,11 @@ os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
 os.environ["SPARSE_CONV_BACKEND"] = "none"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-# Add paths
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "stubs"))
+# Add paths. stubs/ is appended (not prepended) so a pip-installed o_voxel
+# wins over our package stub — the flat override module o_voxel_override_convert
+# is still discoverable either way because it doesn't collide with any package.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "TRELLIS.2"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "stubs"))
 
 import argparse
 import time
@@ -86,13 +88,41 @@ def main():
     tex_size = args.texture_size
 
     if has_voxels and not args.no_texture:
-        # Try Metal-accelerated bake via o_voxel + mtldiffrast if available
+        # Try Metal-accelerated bake via o_voxel + mtldiffrast if available.
+        # Catch AttributeError too: our stubs/o_voxel/ stub has no .postprocess
+        # submodule, so a shadowing stub package trips getattr, not import.
         try:
-            import o_voxel
+            import o_voxel.postprocess
             backend = getattr(o_voxel.postprocess, '_BACKEND', None)
             has_dr = getattr(o_voxel.postprocess, '_HAS_DR', False)
             use_metal = backend == 'metal' and has_dr
-        except ImportError:
+            if use_metal and not getattr(o_voxel.postprocess, '_HAS_FLEX_GEMM', False):
+                # o_voxel's _grid_sample_3d fallback returns [B*C, M] but the
+                # bake consumes it as [M, C]. Patch it to transpose before the
+                # reshape. We avoid installing flex_gemm itself because its
+                # import slows the diffusion hot path ~10x on MPS.
+                import torch.nn.functional as _F_gs
+                def _gs3d_fix(feats, coords, shape, grid, mode='trilinear'):
+                    B, C = shape[0], shape[1]
+                    D, H, W = shape[2], shape[3], shape[4]
+                    device = feats.device
+                    dense_vol = torch.zeros(B, C, D, H, W, dtype=feats.dtype, device=device)
+                    batch_idx = coords[:, 0].long()
+                    cx = coords[:, 1].long(); cy = coords[:, 2].long(); cz = coords[:, 3].long()
+                    dense_vol[batch_idx, :, cx, cy, cz] = feats
+                    grid_norm = torch.stack([
+                        grid[..., 2] / (W - 1) * 2 - 1,
+                        grid[..., 1] / (H - 1) * 2 - 1,
+                        grid[..., 0] / (D - 1) * 2 - 1,
+                    ], dim=-1).reshape(B, 1, 1, -1, 3)
+                    sampled = _F_gs.grid_sample(
+                        dense_vol, grid_norm, mode='bilinear',
+                        align_corners=True, padding_mode='border',
+                    )
+                    M = grid.shape[1]
+                    return sampled.reshape(B, C, M).permute(0, 2, 1).reshape(B * M, C)
+                o_voxel.postprocess._grid_sample_3d = _gs3d_fix
+        except (ImportError, AttributeError):
             use_metal = False
 
         glb_path = f"{args.output}.glb"

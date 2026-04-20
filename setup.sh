@@ -42,15 +42,26 @@ $PIP git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460
 # Requires Xcode Metal Toolchain:
 #     xcodebuild -downloadComponent MetalToolchain
 # Without these, we fall back to a pure-Python KDTree-based texture baker.
+#
+# --no-build-isolation is critical: these packages need torch at build time,
+# and uv's default isolated build env has no torch installed.
 if [ "${SKIP_METAL:-0}" != "1" ]; then
     echo
     echo "Installing Metal backends for texture baking (set SKIP_METAL=1 to skip)..."
-    $PIP git+https://github.com/pedronaugusto/mtlbvh.git     || echo "  mtlbvh install failed — continuing without Metal BVH"
-    $PIP git+https://github.com/pedronaugusto/mtldiffrast.git || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
-    $PIP git+https://github.com/pedronaugusto/mtlmesh.git    || echo "  mtlmesh install failed — continuing without Metal mesh ops"
+    PIP_NB="$PIP --no-build-isolation"
+    # Build deps required by the Metal packages' setup.py
+    $PIP setuptools wheel pybind11
+    $PIP_NB git+https://github.com/pedronaugusto/mtlbvh.git      || echo "  mtlbvh install failed — continuing without Metal BVH"
+    $PIP_NB git+https://github.com/pedronaugusto/mtldiffrast.git || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
+    $PIP_NB git+https://github.com/pedronaugusto/mtlmesh.git     || echo "  mtlmesh install failed — continuing without Metal mesh ops"
+    # Deliberately NOT installing mtlgemm (flex_gemm). Its presence in the
+    # import graph slows the PyTorch MPS diffusion path ~10x end-to-end even
+    # when SPARSE_CONV_BACKEND=none (confirmed via fresh-install benchmarks).
+    # generate.py monkey-patches the one function in o_voxel.postprocess that
+    # depends on it — the fallback works on MPS with no measurable cost.
     # Pedro Naugusto's o_voxel CPU fork — exposes o_voxel.postprocess.to_glb
     # which wraps the Metal stack. Install last so its deps already present.
-    $PIP "git+https://github.com/pedronaugusto/trellis2-apple.git#subdirectory=o-voxel" \
+    $PIP_NB "git+https://github.com/pedronaugusto/trellis2-apple.git#subdirectory=o-voxel" \
         || echo "  o_voxel (Apple fork) install failed — falling back to KDTree baker"
 fi
 

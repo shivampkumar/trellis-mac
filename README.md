@@ -6,18 +6,19 @@ This is a port of Microsoft's TRELLIS.2 — a state-of-the-art image-to-3D model
 
 ## Results
 
-Generates **400K+ vertex meshes with baked PBR textures** from single images in **~3.5 minutes on M4 Pro**.
+Generates **400K+ vertex meshes with baked PBR textures** from a single image in **~5–6 minutes on M4 Pro** (24GB).
 
 Output is a GLB with base-color, metallic, and roughness textures — ready for use in 3D applications.
 
 ### Example
 
-**Input** &rarr; **Generated 3D mesh (424K vertices, 858K triangles)**
+**Input image** &rarr; **Generated 3D mesh** (~400K vertices, ~800K triangles) with Metal-baked PBR textures:
 
 <p>
-<img src="assets/shoe_input.png" width="200">
-<img src="assets/shoe_front.png" width="280">
-<img src="assets/shoe_side.png" width="280">
+<img src="assets/shoe_input.png" width="180">
+<img src="assets/shoe_front.png" width="220">
+<img src="assets/shoe_3q.png" width="260">
+<img src="assets/shoe_side.png" width="220">
 </p>
 
 ## Requirements
@@ -112,22 +113,24 @@ Additionally, all hardcoded `.cuda()` calls throughout the codebase were patched
 
 ## Performance
 
-Benchmarks on M4 Pro (24GB), pipeline type `512`, Metal texture baker enabled:
+Benchmarks on M4 Pro (24GB), pipeline type `512`, Metal texture baker enabled, model weights cached. Numbers below are from a fresh-install end-to-end run (`/usr/bin/time -h python generate.py shoe_input.png`):
 
 | Stage | Time |
 |-------|------|
-| Model loading | ~45s |
-| Image preprocessing | ~5s |
-| Sparse structure sampling | ~15s |
-| Shape SLat sampling | ~90s |
-| Texture SLat sampling | ~50s |
-| Mesh decoding | ~30s |
-| Texture bake (Metal, 1024²) | ~15s |
-| **Total** | **~3.7 min** |
+| Pipeline load (first call) | ~110s |
+| Sparse structure sampling (12 steps) | ~80s |
+| Shape SLat sampling (12 steps) | ~25s |
+| Texture SLat sampling (12 steps) | ~15s |
+| Mesh decoding | ~85s |
+| `fast_simplification` (858K → 200K faces) | ~1s |
+| Texture bake (Metal, 1024²) | ~11s |
+| **Total wall-clock** | **~5m 45s** |
 
 Memory usage peaks at around 18GB unified memory during generation.
 
-With `SKIP_METAL=1` (pure-Python KDTree baker), the texture bake adds ~20s instead of ~15s, and coverage near UV chart boundaries is slightly softer.
+First-ever run adds ~15GB of HuggingFace weight downloads (TRELLIS.2, DINOv3, RMBG-2.0) — network-bound, not included above.
+
+With `SKIP_METAL=1` (pure-Python KDTree baker), the texture bake takes ~15s instead of ~11s, and coverage near UV chart boundaries is slightly softer. All other timings are unchanged.
 
 ## Limitations
 
@@ -135,6 +138,14 @@ With `SKIP_METAL=1` (pure-Python KDTree baker), the texture bake adds ~20s inste
 - **Slower than CUDA**: The pure-PyTorch sparse convolution is ~10× slower than the CUDA `flex_gemm` kernel. This is the main inference bottleneck.
 - **Pre-simplified before texture bake**: The mesh is decimated from ~800K to ~200K faces before Metal BVH construction to avoid builder instability. If you need the full-resolution mesh, export it via the OBJ output (which is written before simplification).
 - **No training support**: Inference only.
+
+### A note on `mtlgemm` / `flex_gemm`
+
+Pedro Naugusto ships a Metal port of `flex_gemm` (at [mtlgemm](https://github.com/pedronaugusto/mtlgemm)). We deliberately **do not** install it in `setup.sh` because its mere presence in the import graph slows the MPS diffusion hot path by ~10× on our benchmark (3.5 min → 36 min) even when `SPARSE_CONV_BACKEND=none`. The only place we actually need `flex_gemm` is a single `grid_sample_3d` call inside `o_voxel.postprocess.to_glb`; `generate.py` monkey-patches that one function with a `torch.nn.functional.grid_sample` fallback so the Metal baker runs without it. Sampled attribute quality is very close; a handful of out-of-distribution voxels show up slightly darker. If you want the original behavior and can accept the slowdown, install `mtlgemm` manually:
+
+```bash
+uv pip install --no-build-isolation git+https://github.com/pedronaugusto/mtlgemm.git
+```
 
 ## License
 

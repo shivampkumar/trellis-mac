@@ -312,10 +312,12 @@ def patch_fdg_vae():
         "from o_voxel.convert import flexible_dual_grid_to_mesh\n",
         "# Force pure-Python mesh extraction — real o_voxel.convert (CUDA or Metal port)\n"
         "# segfaults on decoder output. Import our stub version explicitly.\n"
+        "# stubs/ is appended (not prepended) so a pip-installed o_voxel still wins\n"
+        "# for other submodules like o_voxel.postprocess.\n"
         "import sys, os\n"
         "_stubs = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'stubs')\n"
         "if _stubs not in sys.path:\n"
-        "    sys.path.insert(0, _stubs)\n"
+        "    sys.path.append(_stubs)\n"
         "try:\n"
         "    from o_voxel_override_convert import flexible_dual_grid_to_mesh\n"
         "except ImportError:\n"
