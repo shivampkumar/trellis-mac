@@ -6,7 +6,7 @@ This is a port of Microsoft's TRELLIS.2 — a state-of-the-art image-to-3D model
 
 ## Results
 
-Generates **400K+ vertex meshes with baked PBR textures** from a single image in **~5–6 minutes on M4 Pro** (24GB).
+Generates **400K+ vertex meshes with baked PBR textures** from a single image in **~5 minutes 40 seconds on M4 Pro** (24GB, cold start, weights cached, cool machine). Of that, ~3m 52s is actual generation and baking — the remaining ~1m 45s is pipeline load that happens once per Python process.
 
 Output is a GLB with base-color, metallic, and roughness textures — ready for use in 3D applications.
 
@@ -117,14 +117,14 @@ Benchmarks on M4 Pro (24GB), pipeline type `512`, full Metal stack installed, we
 
 | Stage | Time |
 |-------|------|
-| Pipeline load (first call after `python generate.py …`) | ~105s |
-| Sparse structure sampling (12 steps) | ~80s |
-| Shape SLat sampling (12 steps) | ~25s |
-| Texture SLat sampling (12 steps) | ~12s |
-| Mesh decoding + `fast_simplification` (858K → 200K faces) | ~100s |
-| Texture bake (Metal, 1024²) | ~11s |
-| **Total wall-clock (cold start)** | **~5m 40s** |
-| Generation + bake only (excluding pipeline load) | ~3m 52s |
+| Pipeline load (first call per process) | 104s |
+| Sparse structure sampling (12 steps) | 81s |
+| Shape SLat sampling (12 steps) | 22s |
+| Texture SLat sampling (12 steps) | 12s |
+| Mesh decoding + `fast_simplification` (858K → 200K faces) | ~106s |
+| Texture bake (Metal, 1024²) | 11s |
+| **Total wall-clock (cold start)** | **5m 40s** |
+| Generation + bake only (excluding pipeline load) | 3m 52s |
 
 Memory usage peaks at around 18GB unified memory during generation.
 
