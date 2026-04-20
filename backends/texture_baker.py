@@ -2,14 +2,16 @@
 UV unwrap + texture baking for TRELLIS.2 meshes on Apple Silicon.
 
 Replaces nvdiffrast (CUDA-only) with:
-  - xatlas for UV unwrapping (C++ library, no GPU needed)
-  - Pure-numpy software rasterizer for baking voxel attributes into texture maps
+  - xatlas for UV unwrapping (C++ library, CPU)
+  - Vectorized numpy rasterizer for UV-space triangles
+  - scipy cKDTree for nearest-voxel lookup at native 512 resolution
+  - Inverse-distance weighting for trilinear-like interpolation
 
-Produces GLB files with proper PBR textures (base color, metallic, roughness).
+Produces GLB files with PBR textures (base color, metallic, roughness).
 """
 
 import numpy as np
-import torch
+import time
 
 
 def uv_unwrap(vertices, faces):
@@ -17,7 +19,7 @@ def uv_unwrap(vertices, faces):
     Compute UV coordinates for a mesh using xatlas.
 
     Returns:
-        new_vertices: Remapped vertices (may have more than input due to seams)
+        new_vertices: Remapped vertices
         new_faces: Triangle indices into new_vertices
         uvs: UV coordinates per new vertex, in [0, 1]
         vmapping: Maps new vertex index -> original vertex index
@@ -35,70 +37,38 @@ def uv_unwrap(vertices, faces):
     return new_vertices, new_faces, uvs, vmapping
 
 
-def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size, texture_size=2048):
+def _rasterize_uv_triangles(vertices, faces, uvs, texture_size):
     """
-    Bake voxel attributes into a UV-mapped texture image.
-
-    For each texel in the output image:
-      1. Find which triangle covers this UV position
-      2. Compute barycentric coordinates
-      3. Interpolate 3D position from triangle vertices
-      4. Sample voxel grid at that 3D position (nearest neighbor)
-      5. Write the sampled attributes to the texel
+    Rasterize all triangles in UV space. For each texel, determine which
+    triangle covers it and compute 3D position via barycentric interpolation.
 
     Args:
         vertices: [N, 3] mesh vertices
         faces: [F, 3] triangle indices
         uvs: [N, 2] UV coordinates in [0, 1]
-        voxel_coords: [V, 3] voxel grid coordinates
-        voxel_attrs: [V, C] voxel attributes (base_color=0:3, metallic=3, roughness=4, alpha=5)
-        origin: [3] voxel grid origin
-        voxel_size: float
         texture_size: output texture resolution
 
     Returns:
-        base_color: [H, W, 3] uint8 RGB texture
-        metallic_roughness: [H, W, 3] uint8 (R=0, G=roughness, B=metallic) for glTF
+        positions: [H, W, 3] 3D position at each texel
+        mask: [H, W] bool mask of filled texels
     """
     H = W = texture_size
-
-    # Build voxel spatial hash for fast lookup
-    coord_to_idx = {}
-    coords_np = voxel_coords.numpy() if isinstance(voxel_coords, torch.Tensor) else voxel_coords
-    attrs_np = voxel_attrs.numpy() if isinstance(voxel_attrs, torch.Tensor) else voxel_attrs
-    origin_np = origin.numpy() if isinstance(origin, torch.Tensor) else np.array(origin)
-
-    for i in range(len(coords_np)):
-        key = (int(coords_np[i, 0]), int(coords_np[i, 1]), int(coords_np[i, 2]))
-        coord_to_idx[key] = i
-
-    # Rasterize triangles in UV space
-    base_color = np.zeros((H, W, 3), dtype=np.float32)
-    metallic = np.zeros((H, W), dtype=np.float32)
-    roughness = np.ones((H, W), dtype=np.float32)  # default roughness = 1
+    positions = np.zeros((H, W, 3), dtype=np.float32)
     mask = np.zeros((H, W), dtype=bool)
 
-    # Process each triangle
     n_faces = len(faces)
-    print(f"  Baking {n_faces:,} triangles into {texture_size}x{texture_size} texture...")
+    uv_scale = np.array([W - 1, H - 1], dtype=np.float32)
 
     for fi in range(n_faces):
-        if fi % 50000 == 0 and fi > 0:
-            print(f"    {fi:,}/{n_faces:,} ({100*fi/n_faces:.0f}%)")
+        if fi > 0 and fi % 100000 == 0:
+            print(f"    Rasterizing: {fi:,}/{n_faces:,}")
 
         i0, i1, i2 = faces[fi]
+        uv0 = uvs[i0] * uv_scale
+        uv1 = uvs[i1] * uv_scale
+        uv2 = uvs[i2] * uv_scale
+        p0, p1, p2 = vertices[i0], vertices[i1], vertices[i2]
 
-        # UV coords of this triangle's vertices, scaled to pixel space
-        uv0 = uvs[i0] * np.array([W - 1, H - 1])
-        uv1 = uvs[i1] * np.array([W - 1, H - 1])
-        uv2 = uvs[i2] * np.array([W - 1, H - 1])
-
-        # 3D positions
-        p0 = vertices[i0]
-        p1 = vertices[i1]
-        p2 = vertices[i2]
-
-        # Bounding box in UV pixel space
         min_x = max(int(np.floor(min(uv0[0], uv1[0], uv2[0]))), 0)
         max_x = min(int(np.ceil(max(uv0[0], uv1[0], uv2[0]))), W - 1)
         min_y = max(int(np.floor(min(uv0[1], uv1[1], uv2[1]))), 0)
@@ -107,7 +77,6 @@ def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_
         if max_x < min_x or max_y < min_y:
             continue
 
-        # Precompute barycentric denominator
         d00 = uv1[0] - uv0[0]
         d01 = uv2[0] - uv0[0]
         d10 = uv1[1] - uv0[1]
@@ -117,73 +86,141 @@ def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_
             continue
         inv_denom = 1.0 / denom
 
-        # Scan pixels in bounding box
-        for py in range(min_y, max_y + 1):
-            for px in range(min_x, max_x + 1):
-                # Barycentric coordinates
-                dx = px - uv0[0]
-                dy = py - uv0[1]
-                u = (dx * d11 - d01 * dy) * inv_denom
-                v = (d00 * dy - dx * d10) * inv_denom
-                w = 1.0 - u - v
+        px_range = np.arange(min_x, max_x + 1, dtype=np.float32)
+        py_range = np.arange(min_y, max_y + 1, dtype=np.float32)
+        if len(px_range) == 0 or len(py_range) == 0:
+            continue
 
-                if u < -0.001 or v < -0.001 or w < -0.001:
-                    continue
+        px_grid, py_grid = np.meshgrid(px_range, py_range)
+        dx = px_grid - uv0[0]
+        dy = py_grid - uv0[1]
 
-                # Interpolate 3D position
-                pos = w * p0 + u * p1 + v * p2
+        u = (dx * d11 - d01 * dy) * inv_denom
+        v = (d00 * dy - dx * d10) * inv_denom
+        w = 1.0 - u - v
 
-                # Convert to voxel grid coords
-                grid_pos = (pos - origin_np) / voxel_size
+        inside = (u >= -0.001) & (v >= -0.001) & (w >= -0.001)
+        if not inside.any():
+            continue
 
-                # Nearest-neighbor voxel lookup
-                gx = int(round(grid_pos[0]))
-                gy = int(round(grid_pos[1]))
-                gz = int(round(grid_pos[2]))
+        pos_3d = w[..., None] * p0 + u[..., None] * p1 + v[..., None] * p2
 
-                # Search small neighborhood
-                best_idx = None
-                for ddx in range(-1, 2):
-                    for ddy in range(-1, 2):
-                        for ddz in range(-1, 2):
-                            key = (gx + ddx, gy + ddy, gz + ddz)
-                            if key in coord_to_idx:
-                                best_idx = coord_to_idx[key]
-                                break
-                        if best_idx is not None:
-                            break
-                    if best_idx is not None:
-                        break
+        iy, ix = np.where(inside)
+        positions[py_range.astype(int)[iy], px_range.astype(int)[ix]] = pos_3d[iy, ix]
+        mask[py_range.astype(int)[iy], px_range.astype(int)[ix]] = True
 
-                if best_idx is not None:
-                    a = attrs_np[best_idx]
-                    # Attrs are already in [0,1] for color, just clip
-                    base_color[py, px] = np.clip(a[0:3], 0, 1)
-                    if len(a) > 3:
-                        metallic[py, px] = np.clip(float(a[3]), 0, 1)
-                    if len(a) > 4:
-                        roughness[py, px] = np.clip(float(a[4]), 0, 1)
-                    mask[py, px] = True
+    return positions, mask
 
-    # Aggressive hole-filling: iteratively dilate colored pixels into empty neighbors
+
+def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_size,
+                 texture_size=2048, k_neighbors=8, **kwargs):
+    """
+    Bake voxel attributes into a UV-mapped texture.
+
+    Uses scipy cKDTree on sparse voxels for k-nearest-neighbor lookup
+    with inverse-distance weighting. Avoids dense 3D volume entirely,
+    preserving native voxel resolution without memory pressure.
+
+    Pipeline:
+      1. UV rasterize → 3D position per texel
+      2. KDTree on sparse voxels
+      3. For each texel: k-nearest voxels, inverse-distance-weighted average
+      4. Gamma correct, fill holes, export
+    """
+    from scipy.spatial import cKDTree
+
+    H = W = texture_size
+    t0 = time.time()
+
+    coords_np = voxel_coords.numpy() if hasattr(voxel_coords, 'numpy') else voxel_coords
+    attrs_np = voxel_attrs.numpy() if hasattr(voxel_attrs, 'numpy') else voxel_attrs
+    origin_np = origin.numpy() if hasattr(origin, 'numpy') else np.array(origin)
+
+    C = attrs_np.shape[1]
+    n_voxels = len(coords_np)
+    print(f"  Voxels: {n_voxels:,}, channels: {C}")
+
+    # Voxel world-space positions (voxel centers)
+    voxel_world = coords_np.astype(np.float32) * voxel_size + origin_np + voxel_size * 0.5
+
+    # Build KDTree on voxel positions
+    print(f"  Building KDTree...")
+    t_tree = time.time()
+    tree = cKDTree(voxel_world)
+    print(f"    Tree built in {time.time() - t_tree:.1f}s")
+
+    # Rasterize UV triangles to 3D positions
+    print(f"  Rasterizing {len(faces):,} triangles into {texture_size}x{texture_size}...")
+    t_rast = time.time()
+    positions, mask = _rasterize_uv_triangles(vertices, faces, uvs, texture_size)
+    coverage = mask.sum() / (H * W) * 100
+    print(f"    Coverage: {coverage:.1f}%, rasterized in {time.time() - t_rast:.1f}s")
+
+    # For each valid texel, find k nearest voxels
+    query_points = positions[mask]  # [M, 3]
+    M = len(query_points)
+    print(f"  Querying {M:,} texels, k={k_neighbors}...")
+    t_q = time.time()
+    distances, indices = tree.query(query_points, k=k_neighbors, workers=-1)
+    # distances: [M, k], indices: [M, k]
+    print(f"    Query done in {time.time() - t_q:.1f}s")
+
+    # Inverse-distance weighted average. Use distance threshold to skip far voxels.
+    # voxel_size is world units per voxel; 2x voxel_size = reasonable neighborhood
+    max_dist = voxel_size * 2.0
+    print(f"  Weighting colors (max_dist = {max_dist:.4f})...")
+
+    # Weights: 1 / (d + eps), but zero weight for distances > max_dist
+    eps = voxel_size * 0.1
+    weights = 1.0 / (distances + eps)
+    weights[distances > max_dist] = 0.0
+    weights_sum = weights.sum(axis=1, keepdims=True)
+
+    # Find texels with at least one nearby voxel
+    has_neighbor = (weights_sum > 0).squeeze()
+
+    # Normalize weights
+    weights = np.where(weights_sum > 0, weights / np.maximum(weights_sum, 1e-10), 0.0)
+
+    # Gather colors: attrs_np[indices] → [M, k, C]
+    neighbor_attrs = attrs_np[indices]  # [M, k, C]
+
+    # Weighted sum over k dimension
+    sampled = (neighbor_attrs * weights[..., None]).sum(axis=1)  # [M, C]
+
+    # Write texture
+    base_color = np.zeros((H, W, 3), dtype=np.float32)
+    metallic = np.zeros((H, W), dtype=np.float32)
+    roughness = np.ones((H, W), dtype=np.float32)
+
+    ys, xs = np.where(mask)
+    valid = has_neighbor
+    base_color[ys[valid], xs[valid]] = np.clip(sampled[valid, 0:3], 0, 1)
+    if C > 3:
+        metallic[ys[valid], xs[valid]] = np.clip(sampled[valid, 3], 0, 1)
+    if C > 4:
+        roughness[ys[valid], xs[valid]] = np.clip(sampled[valid, 4], 0, 1)
+
+    valid_mask = np.zeros((H, W), dtype=bool)
+    valid_mask[ys[valid], xs[valid]] = True
+
+    # Fill holes via iterative dilation
     from scipy.ndimage import binary_dilation, uniform_filter
-    print(f"  Filling texture holes...")
-    for iteration in range(8):
-        dilated = binary_dilation(mask, iterations=1)
-        unfilled = dilated & ~mask
+    current_mask = valid_mask.copy()
+    for _ in range(8):
+        dilated = binary_dilation(current_mask, iterations=1)
+        unfilled = dilated & ~current_mask
         if not unfilled.any():
             break
         for c in range(3):
             channel = base_color[:, :, c]
             blurred = uniform_filter(channel, size=3)
             channel[unfilled] = blurred[unfilled]
-        mask = dilated
+        current_mask = dilated
 
-    # Gamma correction: linear -> sRGB for correct display
-    # The voxel attrs are in linear color space; displays expect sRGB
+    # Gamma correction: linear -> sRGB
     base_color = np.power(np.clip(base_color, 0, 1), 1.0 / 2.2)
 
-    # Convert to uint8
     base_color_img = (base_color * 255).astype(np.uint8)
 
     # glTF metallic-roughness: R=0, G=roughness, B=metallic
@@ -191,23 +228,19 @@ def bake_texture(vertices, faces, uvs, voxel_coords, voxel_attrs, origin, voxel_
     mr_img[:, :, 1] = (roughness * 255).astype(np.uint8)
     mr_img[:, :, 2] = (metallic * 255).astype(np.uint8)
 
-    coverage = mask.sum() / (H * W) * 100
-    print(f"  Texture coverage: {coverage:.1f}%")
+    total_coverage = current_mask.sum() / (H * W) * 100
+    print(f"  Final coverage: {total_coverage:.1f}%, total bake: {time.time() - t0:.1f}s")
 
-    return base_color_img, mr_img, mask
+    return base_color_img, mr_img, current_mask
 
 
 def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, output_path="output.glb"):
-    """
-    Export mesh with UV-mapped PBR textures as GLB.
-    """
+    """Export mesh with UV-mapped PBR textures as GLB."""
     import trimesh
     from PIL import Image
 
-    # Create trimesh with UV coordinates
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    # Create material with texture
     base_color_pil = Image.fromarray(base_color_img)
 
     material = trimesh.visual.material.PBRMaterial(
@@ -220,7 +253,6 @@ def export_glb_with_texture(vertices, faces, uvs, base_color_img, mr_img=None, o
         mr_pil = Image.fromarray(mr_img)
         material.metallicRoughnessTexture = mr_pil
 
-    # Apply texture visual
     mesh.visual = trimesh.visual.TextureVisuals(
         uv=uvs,
         material=material,
