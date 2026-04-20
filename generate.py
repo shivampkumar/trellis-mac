@@ -5,11 +5,12 @@ Generate a 3D mesh from a single image using TRELLIS.2 on Apple Silicon.
 import sys
 import os
 
-# Set up backends before any TRELLIS imports
-os.environ["ATTN_BACKEND"] = "sdpa"
-os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
-os.environ["SPARSE_CONV_BACKEND"] = "none"
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+# Set up backends before any TRELLIS imports. Use setdefault so the caller
+# can override from the environment (e.g. SPARSE_CONV_BACKEND=flex_gemm).
+os.environ.setdefault("ATTN_BACKEND", "sdpa")
+os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
+os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Add paths. stubs/ is appended (not prepended) so a pip-installed o_voxel
 # wins over our package stub — the flat override module o_voxel_override_convert
