@@ -86,37 +86,77 @@ def main():
     tex_size = args.texture_size
 
     if has_voxels and not args.no_texture:
-        print(f"\nBaking PBR textures ({tex_size}x{tex_size})...")
+        # Try Metal-accelerated bake via o_voxel + mtldiffrast if available
+        try:
+            import o_voxel
+            backend = getattr(o_voxel.postprocess, '_BACKEND', None)
+            has_dr = getattr(o_voxel.postprocess, '_HAS_DR', False)
+            use_metal = backend == 'metal' and has_dr
+        except ImportError:
+            use_metal = False
+
+        glb_path = f"{args.output}.glb"
         t_bake = time.time()
 
-        from backends.texture_baker import uv_unwrap, bake_texture, export_glb_with_texture
+        if use_metal:
+            print(f"\nBaking PBR textures via Metal ({tex_size}x{tex_size})...")
+            import o_voxel
 
-        voxel_coords = mesh_out.coords.cpu().float()
-        voxel_attrs = mesh_out.attrs.cpu().float()
-        origin = mesh_out.origin.cpu().float()
-        vs = mesh_out.voxel_size
+            # Pre-simplify mesh to avoid mtlbvh crash on large meshes.
+            # Target ~200K faces — keeps detail, avoids Metal BVH issues.
+            import fast_simplification
+            verts_np = mesh_out.vertices.cpu().numpy()
+            faces_np = mesh_out.faces.cpu().numpy()
+            target_faces = min(200000, len(faces_np))
+            if len(faces_np) > target_faces:
+                ratio = 1.0 - (target_faces / len(faces_np))
+                print(f"  Simplifying mesh: {len(faces_np):,} -> ~{target_faces:,} faces")
+                simp_verts, simp_faces = fast_simplification.simplify(verts_np, faces_np, ratio)
+                simp_verts_t = torch.from_numpy(simp_verts).float().to(mesh_out.vertices.device)
+                simp_faces_t = torch.from_numpy(simp_faces.astype('int32')).to(mesh_out.faces.device)
+            else:
+                simp_verts_t = mesh_out.vertices
+                simp_faces_t = mesh_out.faces
 
-        # UV unwrap
-        print("  UV unwrapping with xatlas...")
-        new_verts, new_faces, uvs, vmapping = uv_unwrap(verts, faces)
-        print(f"  UV unwrap: {len(verts):,} -> {len(new_verts):,} vertices ({len(uvs):,} UVs)")
+            # Move all mesh tensors to CPU — o_voxel.to_glb mixes device-neutral
+            # AABB tensor with mesh tensors; keep everything on CPU to avoid mismatch.
+            glb = o_voxel.postprocess.to_glb(
+                vertices=simp_verts_t.cpu(),
+                faces=simp_faces_t.cpu(),
+                attr_volume=mesh_out.attrs.cpu(),
+                coords=mesh_out.coords.cpu(),
+                attr_layout=mesh_out.layout,
+                voxel_size=mesh_out.voxel_size,
+                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                decimation_target=target_faces,
+                texture_size=tex_size,
+                verbose=True,
+            )
+            glb.export(glb_path)
+            print(f"  Saved: {glb_path}")
+        else:
+            print(f"\nBaking PBR textures via KDTree ({tex_size}x{tex_size})...")
+            from backends.texture_baker import uv_unwrap, bake_texture, export_glb_with_texture
 
-        # Bake texture
-        base_color_img, mr_img, mask = bake_texture(
-            new_verts, new_faces, uvs,
-            voxel_coords.numpy(), voxel_attrs.numpy(),
-            origin.numpy(), vs,
-            texture_size=tex_size,
-        )
+            voxel_coords = mesh_out.coords.cpu().float()
+            voxel_attrs = mesh_out.attrs.cpu().float()
+            origin = mesh_out.origin.cpu().float()
+            vs = mesh_out.voxel_size
 
-        # Save texture images
-        PILImage.fromarray(base_color_img).save(f"{args.output}_basecolor.png")
-        print(f"  Saved: {args.output}_basecolor.png")
+            print("  UV unwrapping with xatlas...")
+            new_verts, new_faces, uvs, vmapping = uv_unwrap(verts, faces)
+            print(f"  UV unwrap: {len(verts):,} -> {len(new_verts):,} vertices")
 
-        # Export GLB with proper textures
-        glb_path = f"{args.output}.glb"
-        export_glb_with_texture(new_verts, new_faces, uvs, base_color_img, mr_img, glb_path)
-        print(f"  Saved: {glb_path}")
+            base_color_img, mr_img, mask = bake_texture(
+                new_verts, new_faces, uvs,
+                voxel_coords.numpy(), voxel_attrs.numpy(),
+                origin.numpy(), vs,
+                texture_size=tex_size,
+            )
+
+            PILImage.fromarray(base_color_img).save(f"{args.output}_basecolor.png")
+            export_glb_with_texture(new_verts, new_faces, uvs, base_color_img, mr_img, glb_path)
+            print(f"  Saved: {glb_path}")
 
         t_bake_total = time.time() - t_bake
         print(f"  Bake time: {t_bake_total:.0f}s")

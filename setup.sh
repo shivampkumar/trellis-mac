@@ -29,13 +29,29 @@ source .venv/bin/activate
 
 # Install dependencies
 echo "Installing dependencies..."
-DEPS="torch torchvision torchaudio transformers accelerate huggingface_hub safetensors pillow numpy trimesh scipy tqdm easydict kornia timm imageio opencv-python-headless xatlas"
+DEPS="torch torchvision torchaudio transformers accelerate huggingface_hub safetensors pillow numpy trimesh scipy tqdm easydict kornia timm imageio opencv-python-headless xatlas fast-simplification"
 if command -v uv &>/dev/null; then
-    uv pip install $DEPS
-    uv pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+    PIP="uv pip install"
 else
-    pip install $DEPS
-    pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+    PIP="pip install"
+fi
+$PIP $DEPS
+$PIP git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# Optional Metal acceleration for texture baking.
+# Requires Xcode Metal Toolchain:
+#     xcodebuild -downloadComponent MetalToolchain
+# Without these, we fall back to a pure-Python KDTree-based texture baker.
+if [ "${SKIP_METAL:-0}" != "1" ]; then
+    echo
+    echo "Installing Metal backends for texture baking (set SKIP_METAL=1 to skip)..."
+    $PIP git+https://github.com/pedronaugusto/mtlbvh.git     || echo "  mtlbvh install failed — continuing without Metal BVH"
+    $PIP git+https://github.com/pedronaugusto/mtldiffrast.git || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
+    $PIP git+https://github.com/pedronaugusto/mtlmesh.git    || echo "  mtlmesh install failed — continuing without Metal mesh ops"
+    # Pedro Naugusto's o_voxel CPU fork — exposes o_voxel.postprocess.to_glb
+    # which wraps the Metal stack. Install last so its deps already present.
+    $PIP "git+https://github.com/pedronaugusto/trellis2-apple.git#subdirectory=o-voxel" \
+        || echo "  o_voxel (Apple fork) install failed — falling back to KDTree baker"
 fi
 
 # Clone TRELLIS.2

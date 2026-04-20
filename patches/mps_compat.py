@@ -232,7 +232,12 @@ def patch_birefnet():
 
 
 def patch_mesh_base():
-    """Guard cumesh and flex_gemm imports, make operations skip gracefully."""
+    """Guard cumesh/flex_gemm imports and unconditionally skip in-place mesh
+    ops. TRELLIS.2 calls fill_holes/remove_faces/simplify during decode on the
+    full 400K-vertex mesh; the Metal port of cumesh segfaults on inputs that
+    large, so we skip these decode-time ops entirely. Post-decode mesh
+    simplification happens later via fast_simplification before texture bake.
+    """
     path = os.path.join(TRELLIS_ROOT, "trellis2/representations/mesh/base.py")
     src = read_file(path)
 
@@ -240,7 +245,7 @@ def patch_mesh_base():
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
-    # Guard imports
+    # Guard imports — cumesh/flex_gemm may or may not be present
     src = src.replace(
         "import cumesh\n"
         "from flex_gemm.ops.grid_sample import grid_sample_3d",
@@ -255,44 +260,35 @@ def patch_mesh_base():
         '        raise RuntimeError("flex_gemm requires CUDA")',
     )
 
-    # Guard fill_holes
+    # Unconditionally return from fill_holes (Metal cumesh segfaults on large meshes)
     src = src.replace(
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
-        "        try:\n"
-        "            _ = cumesh.CuMesh\n"
-        "        except:\n"
-        "            return  # Skip hole filling without CUDA\n"
+        "        return  # Skip — Metal cumesh segfaults on large decode meshes\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
 
-    # Guard remove_faces
+    # Unconditionally return from remove_faces
     src = src.replace(
         "    def remove_faces(self, face_mask: torch.Tensor):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def remove_faces(self, face_mask: torch.Tensor):\n"
-        "        try:\n"
-        "            _ = cumesh.CuMesh\n"
-        "        except:\n"
-        "            return\n"
+        "        return\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
 
-    # Guard simplify
+    # Unconditionally return from simplify
     src = src.replace(
         "    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):\n"
-        "        try:\n"
-        "            _ = cumesh.CuMesh\n"
-        "        except:\n"
-        "            return\n"
+        "        return\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
@@ -301,22 +297,33 @@ def patch_mesh_base():
 
 
 def patch_fdg_vae():
-    """Make o_voxel import lazy with fallback."""
+    """Force our pure-Python flexible_dual_grid_to_mesh over any installed
+    o_voxel. The Metal-port o_voxel.convert segfaults on decoder output even
+    when it imports cleanly, so we always prefer our stub implementation.
+    """
     path = os.path.join(TRELLIS_ROOT, "trellis2/models/sc_vaes/fdg_vae.py")
     src = read_file(path)
 
-    if "except (ImportError, RuntimeError)" in src:
+    if "o_voxel_override_convert" in src:
         print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
         return
 
     src = src.replace(
         "from o_voxel.convert import flexible_dual_grid_to_mesh\n",
+        "# Force pure-Python mesh extraction — real o_voxel.convert (CUDA or Metal port)\n"
+        "# segfaults on decoder output. Import our stub version explicitly.\n"
+        "import sys, os\n"
+        "_stubs = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'stubs')\n"
+        "if _stubs not in sys.path:\n"
+        "    sys.path.insert(0, _stubs)\n"
         "try:\n"
-        "    from o_voxel.convert import flexible_dual_grid_to_mesh\n"
-        "except (ImportError, RuntimeError):\n"
-        "    def flexible_dual_grid_to_mesh(*args, **kwargs):\n"
-        '        raise RuntimeError("flexible_dual_grid_to_mesh requires CUDA (o_voxel). '
-        'Mesh extraction not available on MPS.")\n',
+        "    from o_voxel_override_convert import flexible_dual_grid_to_mesh\n"
+        "except ImportError:\n"
+        "    try:\n"
+        "        from o_voxel.convert import flexible_dual_grid_to_mesh\n"
+        "    except (ImportError, RuntimeError):\n"
+        "        def flexible_dual_grid_to_mesh(*args, **kwargs):\n"
+        '            raise RuntimeError("flexible_dual_grid_to_mesh unavailable")\n',
     )
     write_file(path, src)
 
@@ -368,13 +375,22 @@ def install_conv_backend():
 
 
 def install_mesh_extract():
-    """Copy the pure-Python mesh extraction into the o_voxel stub."""
+    """Copy the pure-Python mesh extraction into the o_voxel stub and also as
+    a flat override module. The flat module takes precedence over any
+    Metal/CUDA o_voxel package that might be installed alongside us.
+    """
     stubs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stubs")
     ovoxel_dir = os.path.join(stubs_dir, "o_voxel")
     os.makedirs(ovoxel_dir, exist_ok=True)
 
-    # convert.py (the actual mesh extraction)
     src = os.path.join(BACKENDS_DIR, "mesh_extract.py")
+
+    # Flat override module — loaded before real o_voxel by fdg_vae patch
+    flat_dst = os.path.join(stubs_dir, "o_voxel_override_convert.py")
+    shutil.copy2(src, flat_dst)
+    print(f"  Installed: stubs/o_voxel_override_convert.py")
+
+    # Also the stub package for environments without any o_voxel install
     dst = os.path.join(ovoxel_dir, "convert.py")
     shutil.copy2(src, dst)
     print(f"  Installed: stubs/o_voxel/convert.py")
