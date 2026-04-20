@@ -29,7 +29,7 @@ source .venv/bin/activate
 
 # Install dependencies
 echo "Installing dependencies..."
-DEPS="torch torchvision torchaudio transformers accelerate huggingface_hub safetensors pillow numpy trimesh scipy tqdm easydict kornia timm imageio opencv-python-headless"
+DEPS="torch torchvision torchaudio transformers accelerate huggingface_hub safetensors pillow numpy trimesh scipy tqdm easydict kornia timm imageio opencv-python-headless xatlas"
 if command -v uv &>/dev/null; then
     uv pip install $DEPS
     uv pip install git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8

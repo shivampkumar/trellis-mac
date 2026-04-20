@@ -19,7 +19,7 @@ import argparse
 import time
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image as PILImage
 
 
 def main():
@@ -31,6 +31,15 @@ def main():
         "--pipeline-type", default="512",
         choices=["512", "1024", "1024_cascade"],
         help="Pipeline resolution (default: 512)",
+    )
+    parser.add_argument(
+        "--texture-size", type=int, default=1024,
+        choices=[512, 1024, 2048],
+        help="Texture resolution for PBR baking (default: 1024)",
+    )
+    parser.add_argument(
+        "--no-texture", action="store_true",
+        help="Skip texture baking, export geometry only",
     )
     args = parser.parse_args()
 
@@ -55,7 +64,7 @@ def main():
     print("Device: MPS")
 
     # Load image
-    img = Image.open(args.image)
+    img = PILImage.open(args.image)
     print(f"Input: {args.image} ({img.size[0]}x{img.size[1]})")
 
     # Generate
@@ -70,106 +79,66 @@ def main():
     verts = mesh_out.vertices.cpu().numpy()
     faces = mesh_out.faces.cpu().numpy()
     print(f"\nMesh: {verts.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
-    print(f"Time: {t_gen:.1f}s")
+    print(f"Generation time: {t_gen:.1f}s")
 
-    # Extract vertex colors from voxel attributes
-    has_color = False
-    colors = None
+    # Check for voxel texture data
+    has_voxels = hasattr(mesh_out, "attrs") and mesh_out.attrs is not None
+    tex_size = args.texture_size
 
-    # Try pre-computed vertex attrs first
-    if hasattr(mesh_out, "vertex_attrs") and mesh_out.vertex_attrs is not None:
-        colors = mesh_out.vertex_attrs[:, :3].cpu().numpy()
-        colors = np.clip(colors, 0, 1)
-        has_color = True
+    if has_voxels and not args.no_texture:
+        print(f"\nBaking PBR textures ({tex_size}x{tex_size})...")
+        t_bake = time.time()
 
-    # Otherwise, sample from voxel grid using nearest-neighbor
-    if not has_color and hasattr(mesh_out, "attrs") and mesh_out.attrs is not None:
-        print("Sampling vertex colors from voxel attributes...")
-        coords = mesh_out.coords.cpu().float()       # [N_voxels, 3]
-        attrs = mesh_out.attrs.cpu().float()          # [N_voxels, C]
-        origin = mesh_out.origin.cpu().float()        # [3]
+        from backends.texture_baker import uv_unwrap, bake_texture, export_glb_with_texture
+
+        voxel_coords = mesh_out.coords.cpu().float()
+        voxel_attrs = mesh_out.attrs.cpu().float()
+        origin = mesh_out.origin.cpu().float()
         vs = mesh_out.voxel_size
 
-        # Convert mesh vertices to voxel grid coordinates
-        verts_t = torch.from_numpy(verts).float()
-        grid_pos = (verts_t - origin) / vs            # [N_verts, 3]
+        # UV unwrap
+        print("  UV unwrapping with xatlas...")
+        new_verts, new_faces, uvs, vmapping = uv_unwrap(verts, faces)
+        print(f"  UV unwrap: {len(verts):,} -> {len(new_verts):,} vertices ({len(uvs):,} UVs)")
 
-        # Nearest-neighbor lookup: for each vertex, find closest voxel
-        # Build a spatial hash for fast lookup
-        coord_map = {}
-        for i in range(coords.shape[0]):
-            key = (int(coords[i, 0].item()), int(coords[i, 1].item()), int(coords[i, 2].item()))
-            coord_map[key] = i
+        # Bake texture
+        base_color_img, mr_img, mask = bake_texture(
+            new_verts, new_faces, uvs,
+            voxel_coords.numpy(), voxel_attrs.numpy(),
+            origin.numpy(), vs,
+            texture_size=tex_size,
+        )
 
-        vertex_colors = np.zeros((len(verts), 3), dtype=np.float32)
-        matched = 0
-        for vi in range(len(verts)):
-            # Round to nearest voxel
-            gx, gy, gz = int(round(grid_pos[vi, 0].item())), int(round(grid_pos[vi, 1].item())), int(round(grid_pos[vi, 2].item()))
-            # Search in a small neighborhood
-            best_idx = None
-            for dx in range(3):
-                for dy in range(3):
-                    for dz in range(3):
-                        key = (gx + dx - 1, gy + dy - 1, gz + dz - 1)
-                        if key in coord_map:
-                            best_idx = coord_map[key]
-                            break
-                    if best_idx is not None:
-                        break
-                if best_idx is not None:
-                    break
-            if best_idx is not None:
-                a = attrs[best_idx]
-                # Layout: base_color=0:3, metallic=3, roughness=4, alpha=5
-                rgb = a[0:3].numpy()
-                # Sigmoid if values are in logit space
-                if rgb.max() > 1.5 or rgb.min() < -0.5:
-                    rgb = 1.0 / (1.0 + np.exp(-rgb))
-                vertex_colors[vi] = np.clip(rgb, 0, 1)
-                matched += 1
+        # Save texture images
+        PILImage.fromarray(base_color_img).save(f"{args.output}_basecolor.png")
+        print(f"  Saved: {args.output}_basecolor.png")
 
-        if matched > len(verts) * 0.1:
-            colors = vertex_colors
-            has_color = True
-            print(f"  Matched {matched:,}/{len(verts):,} vertices ({100*matched/len(verts):.0f}%)")
-        else:
-            print(f"  Low match rate ({matched}/{len(verts)}), skipping vertex colors")
+        # Export GLB with proper textures
+        glb_path = f"{args.output}.glb"
+        export_glb_with_texture(new_verts, new_faces, uvs, base_color_img, mr_img, glb_path)
+        print(f"  Saved: {glb_path}")
 
-    # Save OBJ
+        t_bake_total = time.time() - t_bake
+        print(f"  Bake time: {t_bake_total:.0f}s")
+    else:
+        # Fallback: vertex colors only
+        print("\nExporting with vertex colors (use --texture-size for PBR textures)...")
+        import trimesh
+        tm = trimesh.Trimesh(vertices=verts, faces=faces)
+        glb_path = f"{args.output}.glb"
+        tm.export(glb_path)
+        print(f"Saved: {glb_path}")
+
+    # Also save OBJ
     obj_path = f"{args.output}.obj"
     with open(obj_path, "w") as f:
-        for i, v in enumerate(verts):
-            if has_color:
-                r, g, b = colors[i]
-                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {r:.4f} {g:.4f} {b:.4f}\n")
-            else:
-                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        for v in verts:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
         for face in faces:
             f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
     print(f"Saved: {obj_path}")
 
-    # Save GLB
-    try:
-        import trimesh
-
-        if has_color:
-            vertex_colors = np.concatenate(
-                [(colors * 255).astype(np.uint8), np.full((len(colors), 1), 255, dtype=np.uint8)],
-                axis=1,
-            )
-            tm = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
-        else:
-            tm = trimesh.Trimesh(vertices=verts, faces=faces)
-        glb_path = f"{args.output}.glb"
-        tm.export(glb_path)
-        print(f"Saved: {glb_path}")
-    except ImportError:
-        print("Install trimesh for GLB export: pip install trimesh")
-    except Exception as e:
-        print(f"GLB export failed: {e}")
-
-    print(f"\nDone in {t_gen:.1f}s.")
+    print(f"\nTotal time: {t_gen:.1f}s generation + baking")
 
 
 if __name__ == "__main__":
