@@ -72,13 +72,69 @@ def main():
     print(f"\nMesh: {verts.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
     print(f"Time: {t_gen:.1f}s")
 
-    # Extract vertex colors if available
+    # Extract vertex colors from voxel attributes
     has_color = False
     colors = None
+
+    # Try pre-computed vertex attrs first
     if hasattr(mesh_out, "vertex_attrs") and mesh_out.vertex_attrs is not None:
         colors = mesh_out.vertex_attrs[:, :3].cpu().numpy()
         colors = np.clip(colors, 0, 1)
         has_color = True
+
+    # Otherwise, sample from voxel grid using nearest-neighbor
+    if not has_color and hasattr(mesh_out, "attrs") and mesh_out.attrs is not None:
+        print("Sampling vertex colors from voxel attributes...")
+        coords = mesh_out.coords.cpu().float()       # [N_voxels, 3]
+        attrs = mesh_out.attrs.cpu().float()          # [N_voxels, C]
+        origin = mesh_out.origin.cpu().float()        # [3]
+        vs = mesh_out.voxel_size
+
+        # Convert mesh vertices to voxel grid coordinates
+        verts_t = torch.from_numpy(verts).float()
+        grid_pos = (verts_t - origin) / vs            # [N_verts, 3]
+
+        # Nearest-neighbor lookup: for each vertex, find closest voxel
+        # Build a spatial hash for fast lookup
+        coord_map = {}
+        for i in range(coords.shape[0]):
+            key = (int(coords[i, 0].item()), int(coords[i, 1].item()), int(coords[i, 2].item()))
+            coord_map[key] = i
+
+        vertex_colors = np.zeros((len(verts), 3), dtype=np.float32)
+        matched = 0
+        for vi in range(len(verts)):
+            # Round to nearest voxel
+            gx, gy, gz = int(round(grid_pos[vi, 0].item())), int(round(grid_pos[vi, 1].item())), int(round(grid_pos[vi, 2].item()))
+            # Search in a small neighborhood
+            best_idx = None
+            for dx in range(3):
+                for dy in range(3):
+                    for dz in range(3):
+                        key = (gx + dx - 1, gy + dy - 1, gz + dz - 1)
+                        if key in coord_map:
+                            best_idx = coord_map[key]
+                            break
+                    if best_idx is not None:
+                        break
+                if best_idx is not None:
+                    break
+            if best_idx is not None:
+                a = attrs[best_idx]
+                # Layout: base_color=0:3, metallic=3, roughness=4, alpha=5
+                rgb = a[0:3].numpy()
+                # Sigmoid if values are in logit space
+                if rgb.max() > 1.5 or rgb.min() < -0.5:
+                    rgb = 1.0 / (1.0 + np.exp(-rgb))
+                vertex_colors[vi] = np.clip(rgb, 0, 1)
+                matched += 1
+
+        if matched > len(verts) * 0.1:
+            colors = vertex_colors
+            has_color = True
+            print(f"  Matched {matched:,}/{len(verts):,} vertices ({100*matched/len(verts):.0f}%)")
+        else:
+            print(f"  Low match rate ({matched}/{len(verts)}), skipping vertex colors")
 
     # Save OBJ
     obj_path = f"{args.output}.obj"
