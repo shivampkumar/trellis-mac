@@ -6,10 +6,16 @@ import sys
 import os
 
 # Set up backends before any TRELLIS imports. Use setdefault so the caller
-# can override from the environment (e.g. SPARSE_CONV_BACKEND=flex_gemm).
+# can override from the environment. Default conv backend is flex_gemm since
+# Pedro Naugusto's mtlgemm fix (zero-copy on MPS, fp16/bf16 native); fall
+# back to conv_none if flex_gemm isn't importable for some reason.
 os.environ.setdefault("ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
-os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
+try:
+    import flex_gemm  # noqa: F401
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
+except ImportError:
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Add paths. stubs/ is appended (not prepended) so a pip-installed o_voxel
@@ -44,6 +50,10 @@ def main():
         "--no-texture", action="store_true",
         help="Skip texture baking, export geometry only",
     )
+    parser.add_argument(
+        "--steps", type=int, default=None,
+        help="Override sampler steps for all three flow phases (default: pipeline JSON, usually 12)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.image):
@@ -74,7 +84,15 @@ def main():
     print(f"\nGenerating 3D model (pipeline={args.pipeline_type}, seed={args.seed})...")
     t0 = time.time()
 
-    outputs = pipeline.run(img, seed=args.seed, pipeline_type=args.pipeline_type)
+    sampler_overrides = {"steps": args.steps} if args.steps else {}
+    outputs = pipeline.run(
+        img,
+        seed=args.seed,
+        pipeline_type=args.pipeline_type,
+        sparse_structure_sampler_params=sampler_overrides,
+        shape_slat_sampler_params=sampler_overrides,
+        tex_slat_sampler_params=sampler_overrides,
+    )
     t_gen = time.time() - t0
 
     mesh_out = outputs[0] if isinstance(outputs, list) else outputs
