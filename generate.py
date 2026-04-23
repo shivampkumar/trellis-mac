@@ -9,6 +9,11 @@ import os
 # can override from the environment. Default conv backend is flex_gemm since
 # Pedro Naugusto's mtlgemm fix (zero-copy on MPS, fp16/bf16 native); fall
 # back to conv_none if flex_gemm isn't importable for some reason.
+# MPS fallback MUST be set before torch is imported anywhere (including
+# transitively via flex_gemm). Without this, segment_reduce and a few other
+# ops crash instead of falling back to CPU.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 os.environ.setdefault("ATTN_BACKEND", "sdpa")
 os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
 try:
@@ -16,7 +21,6 @@ try:
     os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
 except ImportError:
     os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Add paths. stubs/ is appended (not prepended) so a pip-installed o_voxel
 # wins over our package stub — the flat override module o_voxel_override_convert
