@@ -46,6 +46,10 @@ $PIP git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460
 # --no-build-isolation is critical: these packages need torch at build time,
 # and uv's default isolated build env has no torch installed.
 if [ "${SKIP_METAL:-0}" != "1" ]; then
+    # PyTorch's MPS headers require macOS 12.0+. Some Python builds (e.g. uv's
+    # prebuilt binaries) set -mmacosx-version-min=11.0 which makes the compiler
+    # reject the MPS headers with -Werror. Override to 12.0 for the Metal builds.
+    export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-12.0}
     echo
     echo "Installing Metal backends for texture baking (set SKIP_METAL=1 to skip)..."
     PIP_NB="$PIP --no-build-isolation"
