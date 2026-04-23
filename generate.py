@@ -152,42 +152,48 @@ def main():
         t_bake = time.time()
 
         if use_metal:
-            print(f"\nBaking PBR textures via Metal ({tex_size}x{tex_size})...")
-            import o_voxel
+            try:
+                print(f"\nBaking PBR textures via Metal ({tex_size}x{tex_size})...")
+                import o_voxel
 
-            # Pre-simplify mesh to avoid mtlbvh crash on large meshes.
-            # Target ~200K faces — keeps detail, avoids Metal BVH issues.
-            import fast_simplification
-            verts_np = mesh_out.vertices.cpu().numpy()
-            faces_np = mesh_out.faces.cpu().numpy()
-            target_faces = min(200000, len(faces_np))
-            if len(faces_np) > target_faces:
-                ratio = 1.0 - (target_faces / len(faces_np))
-                print(f"  Simplifying mesh: {len(faces_np):,} -> ~{target_faces:,} faces")
-                simp_verts, simp_faces = fast_simplification.simplify(verts_np, faces_np, ratio)
-                simp_verts_t = torch.from_numpy(simp_verts).float().to(mesh_out.vertices.device)
-                simp_faces_t = torch.from_numpy(simp_faces.astype('int32')).to(mesh_out.faces.device)
-            else:
-                simp_verts_t = mesh_out.vertices
-                simp_faces_t = mesh_out.faces
+                # Pre-simplify mesh to avoid mtlbvh crash on large meshes.
+                # Target ~200K faces — keeps detail, avoids Metal BVH issues.
+                import fast_simplification
+                verts_np = mesh_out.vertices.cpu().numpy()
+                faces_np = mesh_out.faces.cpu().numpy()
+                target_faces = min(200000, len(faces_np))
+                if len(faces_np) > target_faces:
+                    ratio = 1.0 - (target_faces / len(faces_np))
+                    print(f"  Simplifying mesh: {len(faces_np):,} -> ~{target_faces:,} faces")
+                    simp_verts, simp_faces = fast_simplification.simplify(verts_np, faces_np, ratio)
+                    simp_verts_t = torch.from_numpy(simp_verts).float().to(mesh_out.vertices.device)
+                    simp_faces_t = torch.from_numpy(simp_faces.astype('int32')).to(mesh_out.faces.device)
+                else:
+                    simp_verts_t = mesh_out.vertices
+                    simp_faces_t = mesh_out.faces
 
-            # Move all mesh tensors to CPU — o_voxel.to_glb mixes device-neutral
-            # AABB tensor with mesh tensors; keep everything on CPU to avoid mismatch.
-            glb = o_voxel.postprocess.to_glb(
-                vertices=simp_verts_t.cpu(),
-                faces=simp_faces_t.cpu(),
-                attr_volume=mesh_out.attrs.cpu(),
-                coords=mesh_out.coords.cpu(),
-                attr_layout=mesh_out.layout,
-                voxel_size=mesh_out.voxel_size,
-                aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-                decimation_target=target_faces,
-                texture_size=tex_size,
-                verbose=True,
-            )
-            glb.export(glb_path)
-            print(f"  Saved: {glb_path}")
-        else:
+                # Move all mesh tensors to CPU — o_voxel.to_glb mixes device-neutral
+                # AABB tensor with mesh tensors; keep everything on CPU to avoid mismatch.
+                glb = o_voxel.postprocess.to_glb(
+                    vertices=simp_verts_t.cpu(),
+                    faces=simp_faces_t.cpu(),
+                    attr_volume=mesh_out.attrs.cpu(),
+                    coords=mesh_out.coords.cpu(),
+                    attr_layout=mesh_out.layout,
+                    voxel_size=mesh_out.voxel_size,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    decimation_target=target_faces,
+                    texture_size=tex_size,
+                    verbose=True,
+                )
+                glb.export(glb_path)
+                print(f"  Saved: {glb_path}")
+            except RuntimeError as e:
+                print(f"\n  Metal bake failed: {e}")
+                print(f"  Falling back to KDTree texture baker...")
+                use_metal = False
+
+        if not use_metal:
             print(f"\nBaking PBR textures via KDTree ({tex_size}x{tex_size})...")
             from backends.texture_baker import uv_unwrap, bake_texture, export_glb_with_texture
 
