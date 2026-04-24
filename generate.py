@@ -202,8 +202,20 @@ def main():
             origin = mesh_out.origin.cpu().float()
             vs = mesh_out.voxel_size
 
+            # Simplify before UV unwrap — xatlas is very slow on 800K+ vertex meshes
+            bake_verts, bake_faces = verts, faces
+            target_faces = min(200000, len(faces))
+            if len(faces) > target_faces:
+                try:
+                    import fast_simplification
+                    ratio = 1.0 - (target_faces / len(faces))
+                    print(f"  Simplifying mesh: {len(faces):,} -> ~{target_faces:,} faces")
+                    bake_verts, bake_faces = fast_simplification.simplify(verts, faces, ratio)
+                except ImportError:
+                    print(f"  Warning: fast_simplification not installed, UV unwrapping full mesh (slow)")
+
             print("  UV unwrapping with xatlas...")
-            new_verts, new_faces, uvs, vmapping = uv_unwrap(verts, faces)
+            new_verts, new_faces, uvs, vmapping = uv_unwrap(bake_verts, bake_faces)
             print(f"  UV unwrap: {len(verts):,} -> {len(new_verts):,} vertices")
 
             base_color_img, mr_img, mask = bake_texture(
