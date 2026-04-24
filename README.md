@@ -64,6 +64,14 @@ To skip the Metal build (for example on older hardware or to speed up setup):
 SKIP_METAL=1 bash setup.sh
 ```
 
+`setup.sh` now pre-clones Git dependencies into `deps/` so all network I/O happens up front.  
+If setup looks inconsistent or you are unsure about local clone state, remove `deps/` and run setup again:
+
+```bash
+rm -rf deps
+bash setup.sh
+```
+
 Output files are saved to the current directory (or use `--output` to specify a path).
 
 ## Usage
