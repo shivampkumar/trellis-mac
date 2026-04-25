@@ -10,3 +10,4 @@ stubs/
 .DS_Store
 progress-assets/
 PROGRESS.md
+.deps/
