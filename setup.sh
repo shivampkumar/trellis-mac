@@ -10,6 +10,49 @@ cd "$(dirname "$0")"
 echo "=== TRELLIS.2 for Apple Silicon — Setup ==="
 echo
 
+# ---------------------------------------------------------------------------
+# Pre-clone Git dependencies so that all network I/O happens up front.
+# If a clone fails you can retry just this section without re-running the
+# whole script — the "if [ ! -d …]" guards make it idempotent.
+# ---------------------------------------------------------------------------
+DEPS_DIR="deps"
+mkdir -p "$DEPS_DIR"
+
+clone_dep() {
+    local url="$1" dir="$2" ref="${3:-}"
+    if [ ! -d "$DEPS_DIR/$dir" ]; then
+        echo "Cloning $dir ..."
+        git clone --depth 1 ${ref:+--branch "$ref"} "$url" "$DEPS_DIR/$dir"
+    else
+        echo "  $dir already cloned — skipping"
+    fi
+}
+
+# utils3d needs a specific commit, so clone without --depth and checkout
+if [ ! -d "$DEPS_DIR/utils3d" ]; then
+    echo "Cloning utils3d ..."
+    git clone https://github.com/EasternJournalist/utils3d.git "$DEPS_DIR/utils3d"
+    git -C "$DEPS_DIR/utils3d" checkout 9a4eb15e4021b67b12c460c7057d642626897ec8
+else
+    echo "  utils3d already cloned — skipping"
+fi
+
+clone_dep https://github.com/pedronaugusto/mtlbvh.git       mtlbvh
+clone_dep https://github.com/pedronaugusto/mtldiffrast.git   mtldiffrast
+clone_dep https://github.com/pedronaugusto/mtlmesh.git       mtlmesh
+clone_dep https://github.com/pedronaugusto/mtlgemm.git       mtlgemm
+clone_dep https://github.com/pedronaugusto/trellis2-apple.git trellis2-apple
+
+# TRELLIS.2 lives at the project root (patches and generate.py expect it there)
+if [ ! -d "TRELLIS.2" ]; then
+    echo "Cloning TRELLIS.2 ..."
+    git clone --depth 1 https://github.com/microsoft/TRELLIS.2.git TRELLIS.2
+else
+    echo "  TRELLIS.2 already cloned — skipping"
+fi
+
+echo
+
 # Check Apple Silicon
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "Warning: This project requires Apple Silicon (M1 or later)."
@@ -36,7 +79,7 @@ else
     PIP="pip install"
 fi
 $PIP $DEPS
-$PIP git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+$PIP "$DEPS_DIR/utils3d"
 
 # Optional Metal acceleration for texture baking.
 # Requires Xcode Metal Toolchain:
@@ -55,24 +98,18 @@ if [ "${SKIP_METAL:-0}" != "1" ]; then
     PIP_NB="$PIP --no-build-isolation"
     # Build deps required by the Metal packages' setup.py
     $PIP setuptools wheel pybind11
-    $PIP_NB git+https://github.com/pedronaugusto/mtlbvh.git      || echo "  mtlbvh install failed — continuing without Metal BVH"
-    $PIP_NB git+https://github.com/pedronaugusto/mtldiffrast.git || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
-    $PIP_NB git+https://github.com/pedronaugusto/mtlmesh.git     || echo "  mtlmesh install failed — continuing without Metal mesh ops"
+    $PIP_NB "$DEPS_DIR/mtlbvh"      || echo "  mtlbvh install failed — continuing without Metal BVH"
+    $PIP_NB "$DEPS_DIR/mtldiffrast" || echo "  mtldiffrast install failed — continuing without Metal rasterizer"
+    $PIP_NB "$DEPS_DIR/mtlmesh"     || echo "  mtlmesh install failed — continuing without Metal mesh ops"
     # mtlgemm provides flex_gemm.ops.grid_sample. The Metal baker in
     # o_voxel.postprocess prefers this over a torch.nn.functional.grid_sample
     # fallback, and the flex_gemm sparse sampling produces noticeably cleaner
     # texture baking (no concentric ring artifacts on curved surfaces).
-    $PIP_NB git+https://github.com/pedronaugusto/mtlgemm.git     || echo "  mtlgemm install failed — baker will use a lower-quality torch.nn.functional.grid_sample fallback"
+    $PIP_NB "$DEPS_DIR/mtlgemm"     || echo "  mtlgemm install failed — baker will use a lower-quality torch.nn.functional.grid_sample fallback"
     # Pedro Naugusto's o_voxel CPU fork — exposes o_voxel.postprocess.to_glb
     # which wraps the Metal stack. Install last so its deps already present.
-    $PIP_NB "git+https://github.com/pedronaugusto/trellis2-apple.git#subdirectory=o-voxel" \
+    $PIP_NB "$DEPS_DIR/trellis2-apple/o-voxel" \
         || echo "  o_voxel (Apple fork) install failed — falling back to KDTree baker"
-fi
-
-# Clone TRELLIS.2
-if [ ! -d "TRELLIS.2" ]; then
-    echo "Cloning TRELLIS.2..."
-    git clone --depth 1 https://github.com/microsoft/TRELLIS.2.git TRELLIS.2
 fi
 
 # Apply source patches (this also installs stubs and backends)
