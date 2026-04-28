@@ -89,20 +89,62 @@ def main():
     t0 = time.time()
 
     sampler_overrides = {"steps": args.steps} if args.steps else {}
-    outputs = pipeline.run(
-        img,
-        seed=args.seed,
-        pipeline_type=args.pipeline_type,
-        sparse_structure_sampler_params=sampler_overrides,
-        shape_slat_sampler_params=sampler_overrides,
-        tex_slat_sampler_params=sampler_overrides,
-    )
+
+    def _watchdog_help_message():
+        return (
+            "\nERROR: The decoder produced an empty mesh.\n"
+            "On Apple Silicon this is almost always the macOS GPU watchdog\n"
+            "killing a long-running Metal kernel in the SLat decoder. The Metal\n"
+            "error prints to stderr above (look for\n"
+            "'kIOGPUCommandBufferCallbackErrorImpactingInteractivity') but does\n"
+            "not raise a Python exception, so execution continues with empty\n"
+            "tensors and crashes downstream.\n"
+            "\n"
+            "Workarounds, cheapest first:\n"
+            "  1. Run headless — close the lid / unplug external displays and\n"
+            "     re-run over SSH. The watchdog tightens with WindowServer load.\n"
+            "  2. MTL_CAPTURE_ENABLED=1 python generate.py ...   (extends the\n"
+            "     watchdog timeout as a side effect of Metal-debugger mode)\n"
+            "  3. SPARSE_CONV_BACKEND=none python generate.py ... (slower path,\n"
+            "     may not help if a single dispatch is the offender)\n"
+            "\n"
+            "Tracking issue: https://github.com/shivampkumar/trellis-mac/issues\n"
+        )
+
+    try:
+        outputs = pipeline.run(
+            img,
+            seed=args.seed,
+            pipeline_type=args.pipeline_type,
+            sparse_structure_sampler_params=sampler_overrides,
+            shape_slat_sampler_params=sampler_overrides,
+            tex_slat_sampler_params=sampler_overrides,
+        )
+    except (IndexError, AssertionError) as e:
+        msg = str(e)
+        # Two known watchdog-corruption signatures:
+        #   IndexError: max(): Expected reduction dim 0 to have non-zero size
+        #     — empty SparseTensor in decode_latent's spatial_shape calc
+        #   AssertionError: BVH needs at least 8 triangles, got 0
+        #     — empty mesh propagating into o_voxel.postprocess.to_glb
+        watchdog_signatures = (
+            "non-zero size",
+            "BVH needs at least 8 triangles",
+        )
+        if any(sig in msg for sig in watchdog_signatures):
+            print(_watchdog_help_message())
+            sys.exit(2)
+        raise
+
     t_gen = time.time() - t0
 
     mesh_out = outputs[0] if isinstance(outputs, list) else outputs
 
     verts = mesh_out.vertices.cpu().numpy()
     faces = mesh_out.faces.cpu().numpy()
+    if verts.shape[0] == 0 or faces.shape[0] == 0:
+        print(_watchdog_help_message())
+        sys.exit(2)
     print(f"\nMesh: {verts.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
     print(f"Generation time: {t_gen:.1f}s")
 
