@@ -19,7 +19,12 @@ os.environ.setdefault("SPARSE_ATTN_BACKEND", "sdpa")
 try:
     import flex_gemm  # noqa: F401
     os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
-except ImportError:
+except (ImportError, RuntimeError):
+    # ImportError: package not installed (SKIP_METAL=1 or install failed).
+    # RuntimeError: metallib load failure — flex_gemm ships an MSL 4.0
+    # metallib which only loads on macOS 26+. On older macOS the import
+    # itself raises "Failed to load metallib ... language version 4.0
+    # which is not supported on this OS". Fall back to conv_none either way.
     os.environ.setdefault("SPARSE_CONV_BACKEND", "none")
 
 # Add paths. stubs/ is appended (not prepended) so a pip-installed o_voxel
