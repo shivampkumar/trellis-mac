@@ -232,11 +232,24 @@ def patch_birefnet():
 
 
 def patch_mesh_base():
-    """Guard cumesh/flex_gemm imports and unconditionally skip in-place mesh
-    ops. TRELLIS.2 calls fill_holes/remove_faces/simplify during decode on the
-    full 400K-vertex mesh; the Metal port of cumesh segfaults on inputs that
-    large, so we skip these decode-time ops entirely. Post-decode mesh
-    simplification happens later via fast_simplification before texture bake.
+    """Guard cumesh/flex_gemm imports, replace .cuda() with .to(self.device),
+    and gate cumesh-using mesh ops on `cumesh is not None`.
+
+    Historical note: this patcher used to unconditionally skip
+    fill_holes / remove_faces / simplify because Pedro Naugusto's Metal port
+    of cumesh used `atomic_min`/`atomic_max` on `float`, which is an
+    Apple9-only feature; on Apple7/8 (M1/M2) the kernel failed at
+    pipeline-creation time and crashed the whole pipeline.
+
+    With the Apple7/8 atomic-fallback patch in pedronaugusto/mtlmesh#1,
+    cumesh runs end-to-end on M1/M2, and skipping fill_holes measurably
+    hurts output quality (decoder mesh ships with ~4128 boundary loops
+    worth of small holes that the bake-time Metal stack only partially
+    closes — visible as see-through cylinders in the rendered GLB).
+
+    Soft-failure for users on unpatched mtlmesh is handled at the *caller*
+    site (`pipelines/trellis2_image_to_3d.py:474`) via a try/except, so
+    the body of each mesh method here stays straightforward.
     """
     path = os.path.join(TRELLIS_ROOT, "trellis2/representations/mesh/base.py")
     src = read_file(path)
@@ -260,39 +273,75 @@ def patch_mesh_base():
         '        raise RuntimeError("flex_gemm requires CUDA")',
     )
 
-    # Unconditionally return from fill_holes (Metal cumesh segfaults on large meshes)
+    # Replace `.cuda()` with `.to(self.device)` and add a `cumesh is None` early
+    # return so methods are no-ops on CPU-only builds rather than crashing.
     src = src.replace(
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def fill_holes(self, max_hole_perimeter=3e-2):\n"
-        "        return  # Skip — Metal cumesh segfaults on large decode meshes\n"
+        "        if cumesh is None:\n"
+        "            return  # cumesh unavailable (CPU-only build)\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
-
-    # Unconditionally return from remove_faces
     src = src.replace(
         "    def remove_faces(self, face_mask: torch.Tensor):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def remove_faces(self, face_mask: torch.Tensor):\n"
-        "        return\n"
+        "        if cumesh is None:\n"
+        "            return  # cumesh unavailable (CPU-only build)\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
-
-    # Unconditionally return from simplify
     src = src.replace(
         "    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):\n"
         "        vertices = self.vertices.cuda()\n"
         "        faces = self.faces.cuda()",
         "    def simplify(self, target=1000000, verbose: bool=False, options: dict={}):\n"
-        "        return\n"
+        "        if cumesh is None:\n"
+        "            return  # cumesh unavailable (CPU-only build)\n"
         "        vertices = self.vertices.to(self.device)\n"
         "        faces = self.faces.to(self.device)",
     )
 
+    write_file(path, src)
+
+
+def patch_pipeline_runtime_fallback():
+    """Wrap decode-time `m.fill_holes()` in a try/except so users on
+    unpatched mtlmesh (Apple7/8 without the atomic-fallback fix) degrade
+    gracefully instead of crashing the whole pipeline.
+    """
+    path = os.path.join(TRELLIS_ROOT, "trellis2/pipelines/trellis2_image_to_3d.py")
+    src = read_file(path)
+    if "fill_holes_warning_emitted" in src:
+        print(f"  Already patched: {os.path.relpath(path, TRELLIS_ROOT)}")
+        return
+
+    needle = "            m.fill_holes()"
+    replacement = (
+        "            try:\n"
+        "                m.fill_holes()\n"
+        "            except RuntimeError as e:\n"
+        "                # Apple7/8 (M1/M2) Metal cumesh without\n"
+        "                # pedronaugusto/mtlmesh#1 raises here. Degrade\n"
+        "                # gracefully (output mesh will have small holes).\n"
+        "                import warnings\n"
+        "                if not getattr(self, '_fill_holes_warning_emitted', False):\n"
+        "                    warnings.warn(\n"
+        '                        f"cumesh.fill_holes failed ({e}); skipping. "\n'
+        '                        \"On M1/M2 update mtlmesh to a build with \"\n'
+        '                        \"pedronaugusto/mtlmesh#1 (Apple7/8 atomic fallback).\",\n'
+        "                        stacklevel=2,\n"
+        "                    )\n"
+        "                    self._fill_holes_warning_emitted = True\n"
+    )
+    if needle not in src:
+        print(f"  Skipping (call site moved): {os.path.relpath(path, TRELLIS_ROOT)}")
+        return
+    src = src.replace(needle, replacement)
     write_file(path, src)
 
 
@@ -437,6 +486,7 @@ def main():
     patch_image_feature_extractor()
     patch_birefnet()
     patch_mesh_base()
+    patch_pipeline_runtime_fallback()
     patch_fdg_vae()
     patch_pipeline()
     patch_pipeline_base()
