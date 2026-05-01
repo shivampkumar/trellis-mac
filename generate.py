@@ -63,6 +63,15 @@ def main():
         "--steps", type=int, default=None,
         help="Override sampler steps for all three flow phases (default: pipeline JSON, usually 12)",
     )
+    parser.add_argument(
+        "--dit-dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
+        help=(
+            "Compute dtype for the three flow DiTs (default: bfloat16, matches upstream "
+            "training/inference). 'float16' is ~25-32%% faster on Apple Silicon SDPA + "
+            "matmul kernels with sub-pixel mesh deviation; visual quality is essentially "
+            "identical. Single-seed numerical parity with upstream is sacrificed."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.image):
@@ -84,6 +93,43 @@ def main():
     # Move to MPS
     pipeline.to(torch.device("mps"))
     print("Device: MPS")
+
+    # Optionally cast the three DiT flow models to a smaller compute dtype.
+    # Upstream weights ship as bf16; on Apple Silicon, fp16 SDPA + matmul are
+    # ~1.3x faster than bf16, so fp16 gives roughly 25-32% wall-clock savings
+    # on the sampling phase with sub-pixel mesh deviation. The shape and tex
+    # VAE decoders ship as fp16 already and are NOT recast — they're tiny
+    # relative to the DiTs and accurate intermediates matter more there.
+    #
+    # We use the model's own `convert_to(dtype)` method when available rather
+    # than a plain `.to(dtype)`, because `convert_to` also updates `self.dtype`
+    # which the forward pass uses to drive `manual_cast(x, self.dtype)` on
+    # intermediates. A bare `.to(dtype)` would cast the parameters but leave
+    # the manual-cast targets at bf16 — silently undoing the speedup.
+    target_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.dit_dtype]
+    if target_dtype is not torch.bfloat16:
+        for k in (
+            "sparse_structure_flow_model",
+            "shape_slat_flow_model_512",
+            "shape_slat_flow_model_1024",
+            "tex_slat_flow_model_512",
+            "tex_slat_flow_model_1024",
+        ):
+            m = pipeline.models.get(k)
+            if m is None:
+                continue
+            convert_to = getattr(m, "convert_to", None)
+            if callable(convert_to):
+                convert_to(target_dtype)
+            else:
+                m.to(target_dtype)
+                if hasattr(m, "dtype"):
+                    m.dtype = target_dtype
+        print(f"DiT dtype: {args.dit_dtype}")
 
     # Load image
     img = PILImage.open(args.image)
