@@ -63,9 +63,31 @@ def main():
         "--steps", type=int, default=None,
         help="Override sampler steps for all three flow phases (default: pipeline JSON, usually 12)",
     )
+    parser.add_argument(
+        "--save-intermediate", default=None,
+        help=(
+            "Path to a .pt file. After pipeline.run() completes, dump the "
+            "decoded mesh + voxel attributes (vertices/faces/attrs/coords/"
+            "origin/voxel_size/layout) to this path so a subsequent run can "
+            "skip the 15-20+ minute generation phase via --load-intermediate "
+            "and only re-bake textures."
+        ),
+    )
+    parser.add_argument(
+        "--load-intermediate", default=None,
+        help=(
+            "Path to a .pt file previously written via --save-intermediate. "
+            "If set, skip pipeline construction and pipeline.run() entirely "
+            "and load the cached mesh + voxel attributes from disk. The "
+            "image argument and any --pipeline-type / --seed / --steps / "
+            "--dit-dtype values are ignored. Useful for iterating on bake "
+            "settings (texture-size, hole-fill, alpha-mode) without paying "
+            "the sampling cost again."
+        ),
+    )
     args = parser.parse_args()
 
-    if not os.path.exists(args.image):
+    if args.load_intermediate is None and not os.path.exists(args.image):
         print(f"Error: {args.image} not found")
         sys.exit(1)
 
@@ -73,85 +95,117 @@ def main():
     print("TRELLIS.2 on Apple Silicon")
     print("=" * 60)
 
-    # Load pipeline
-    print("\nLoading pipeline...")
-    t0 = time.time()
-    from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
+    # --- Bake-only fast path: load a previously-saved mesh + voxel state ---
+    # When --load-intermediate is set, skip pipeline construction / .to(mps) /
+    # the full sampling+decode loop. Useful for iterating on bake settings
+    # without paying ~15-20 min of sampling on each iteration.
+    if args.load_intermediate is not None:
+        print(f"\nLoading intermediate from {args.load_intermediate}...")
+        t0 = time.time()
+        from types import SimpleNamespace
+        blob = torch.load(args.load_intermediate, map_location="cpu", weights_only=False)
+        mesh_out = SimpleNamespace(**blob)
+        t_gen = 0.0
+        print(f"Loaded intermediate in {time.time() - t0:.1f}s")
+    else:
+        # Load pipeline
+        print("\nLoading pipeline...")
+        t0 = time.time()
+        from trellis2.pipelines.trellis2_image_to_3d import Trellis2ImageTo3DPipeline
 
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-    print(f"Loaded in {time.time() - t0:.0f}s")
+        pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        print(f"Loaded in {time.time() - t0:.0f}s")
 
-    # Move to MPS
-    pipeline.to(torch.device("mps"))
-    print("Device: MPS")
+        # Move to MPS
+        pipeline.to(torch.device("mps"))
+        print("Device: MPS")
 
-    # Load image
-    img = PILImage.open(args.image)
-    print(f"Input: {args.image} ({img.size[0]}x{img.size[1]})")
+        # Load image
+        img = PILImage.open(args.image)
+        print(f"Input: {args.image} ({img.size[0]}x{img.size[1]})")
 
-    # Generate
-    print(f"\nGenerating 3D model (pipeline={args.pipeline_type}, seed={args.seed})...")
-    t0 = time.time()
+        # Generate
+        print(f"\nGenerating 3D model (pipeline={args.pipeline_type}, seed={args.seed})...")
+        t0 = time.time()
 
-    sampler_overrides = {"steps": args.steps} if args.steps else {}
+        sampler_overrides = {"steps": args.steps} if args.steps else {}
 
-    def _watchdog_help_message():
-        return (
-            "\nERROR: The decoder produced an empty mesh.\n"
-            "On Apple Silicon this is almost always the macOS GPU watchdog\n"
-            "killing a long-running Metal kernel in the SLat decoder. The Metal\n"
-            "error prints to stderr above (look for\n"
-            "'kIOGPUCommandBufferCallbackErrorImpactingInteractivity') but does\n"
-            "not raise a Python exception, so execution continues with empty\n"
-            "tensors and crashes downstream.\n"
-            "\n"
-            "Workarounds, cheapest first:\n"
-            "  1. Run headless — close the lid / unplug external displays and\n"
-            "     re-run over SSH. The watchdog tightens with WindowServer load.\n"
-            "  2. MTL_CAPTURE_ENABLED=1 python generate.py ...   (extends the\n"
-            "     watchdog timeout as a side effect of Metal-debugger mode)\n"
-            "  3. SPARSE_CONV_BACKEND=none python generate.py ... (slower path,\n"
-            "     may not help if a single dispatch is the offender)\n"
-            "\n"
-            "Tracking issue: https://github.com/shivampkumar/trellis-mac/issues\n"
-        )
+        def _watchdog_help_message():
+            return (
+                "\nERROR: The decoder produced an empty mesh.\n"
+                "On Apple Silicon this is almost always the macOS GPU watchdog\n"
+                "killing a long-running Metal kernel in the SLat decoder. The Metal\n"
+                "error prints to stderr above (look for\n"
+                "'kIOGPUCommandBufferCallbackErrorImpactingInteractivity') but does\n"
+                "not raise a Python exception, so execution continues with empty\n"
+                "tensors and crashes downstream.\n"
+                "\n"
+                "Workarounds, cheapest first:\n"
+                "  1. Run headless — close the lid / unplug external displays and\n"
+                "     re-run over SSH. The watchdog tightens with WindowServer load.\n"
+                "  2. MTL_CAPTURE_ENABLED=1 python generate.py ...   (extends the\n"
+                "     watchdog timeout as a side effect of Metal-debugger mode)\n"
+                "  3. SPARSE_CONV_BACKEND=none python generate.py ... (slower path,\n"
+                "     may not help if a single dispatch is the offender)\n"
+                "\n"
+                "Tracking issue: https://github.com/shivampkumar/trellis-mac/issues\n"
+            )
 
-    try:
-        outputs = pipeline.run(
-            img,
-            seed=args.seed,
-            pipeline_type=args.pipeline_type,
-            sparse_structure_sampler_params=sampler_overrides,
-            shape_slat_sampler_params=sampler_overrides,
-            tex_slat_sampler_params=sampler_overrides,
-        )
-    except (IndexError, AssertionError) as e:
-        msg = str(e)
-        # Two known watchdog-corruption signatures:
-        #   IndexError: max(): Expected reduction dim 0 to have non-zero size
-        #     — empty SparseTensor in decode_latent's spatial_shape calc
-        #   AssertionError: BVH needs at least 8 triangles, got 0
-        #     — empty mesh propagating into o_voxel.postprocess.to_glb
-        watchdog_signatures = (
-            "non-zero size",
-            "BVH needs at least 8 triangles",
-        )
-        if any(sig in msg for sig in watchdog_signatures):
+        try:
+            outputs = pipeline.run(
+                img,
+                seed=args.seed,
+                pipeline_type=args.pipeline_type,
+                sparse_structure_sampler_params=sampler_overrides,
+                shape_slat_sampler_params=sampler_overrides,
+                tex_slat_sampler_params=sampler_overrides,
+            )
+        except (IndexError, AssertionError) as e:
+            msg = str(e)
+            # Two known watchdog-corruption signatures:
+            #   IndexError: max(): Expected reduction dim 0 to have non-zero size
+            #     — empty SparseTensor in decode_latent's spatial_shape calc
+            #   AssertionError: BVH needs at least 8 triangles, got 0
+            #     — empty mesh propagating into o_voxel.postprocess.to_glb
+            watchdog_signatures = (
+                "non-zero size",
+                "BVH needs at least 8 triangles",
+            )
+            if any(sig in msg for sig in watchdog_signatures):
+                print(_watchdog_help_message())
+                sys.exit(2)
+            raise
+
+        t_gen = time.time() - t0
+
+        mesh_out = outputs[0] if isinstance(outputs, list) else outputs
+
+        verts_t = mesh_out.vertices.cpu().numpy()
+        faces_t = mesh_out.faces.cpu().numpy()
+        if verts_t.shape[0] == 0 or faces_t.shape[0] == 0:
             print(_watchdog_help_message())
             sys.exit(2)
-        raise
 
-    t_gen = time.time() - t0
-
-    mesh_out = outputs[0] if isinstance(outputs, list) else outputs
+        # Persist mesh + voxel state so a future run can skip generation entirely.
+        if args.save_intermediate is not None:
+            blob = {
+                "vertices": mesh_out.vertices.cpu(),
+                "faces": mesh_out.faces.cpu(),
+                "attrs": mesh_out.attrs.cpu() if getattr(mesh_out, "attrs", None) is not None else None,
+                "coords": mesh_out.coords.cpu() if getattr(mesh_out, "coords", None) is not None else None,
+                "origin": mesh_out.origin.cpu() if getattr(mesh_out, "origin", None) is not None else None,
+                "voxel_size": mesh_out.voxel_size,
+                "layout": getattr(mesh_out, "layout", None),
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(args.save_intermediate)) or ".", exist_ok=True)
+            torch.save(blob, args.save_intermediate)
+            print(f"Saved intermediate -> {args.save_intermediate}")
 
     verts = mesh_out.vertices.cpu().numpy()
     faces = mesh_out.faces.cpu().numpy()
-    if verts.shape[0] == 0 or faces.shape[0] == 0:
-        print(_watchdog_help_message())
-        sys.exit(2)
     print(f"\nMesh: {verts.shape[0]:,} vertices, {faces.shape[0]:,} triangles")
-    print(f"Generation time: {t_gen:.1f}s")
+    if t_gen > 0:
+        print(f"Generation time: {t_gen:.1f}s")
 
     # Check for voxel texture data
     has_voxels = hasattr(mesh_out, "attrs") and mesh_out.attrs is not None
