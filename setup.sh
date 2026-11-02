@@ -42,6 +42,9 @@ clone_dep https://github.com/pedronaugusto/mtldiffrast.git   mtldiffrast
 clone_dep https://github.com/pedronaugusto/mtlmesh.git       mtlmesh
 clone_dep https://github.com/pedronaugusto/mtlgemm.git       mtlgemm
 clone_dep https://github.com/pedronaugusto/trellis2-apple.git trellis2-apple
+# trellis2-apple vendors Eigen as a submodule; o-voxel's CPU extension needs
+# <Eigen/Dense>, so make sure it is present even on an existing clone.
+git -C "$DEPS_DIR/trellis2-apple" submodule update --init --recursive
 
 # TRELLIS.2 lives at the project root (patches and generate.py expect it there)
 if [ ! -d "TRELLIS.2" ]; then
@@ -95,6 +98,18 @@ if [ "${SKIP_METAL:-0}" != "1" ]; then
     export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-12.0}
     echo
     echo "Installing Metal backends for texture baking (set SKIP_METAL=1 to skip)..."
+
+    # PyTorch 2.15+ headers require C++20 (torch/all.h raises
+    # "#error C++20 or later compatible compiler is required"). The forks below
+    # pin -std=c++17 in their setup.py; because torch's build_ext only injects
+    # its own -std=c++20 when no -std flag is present, the pin suppresses it and
+    # compilation fails. Bump the pinned flags to C++20 before building.
+    for pkg in mtlbvh mtldiffrast mtlmesh mtlgemm trellis2-apple/o-voxel; do
+        if [ -f "$DEPS_DIR/$pkg/setup.py" ]; then
+            sed -i '' 's/c++17/c++20/g' "$DEPS_DIR/$pkg/setup.py"
+        fi
+    done
+
     PIP_NB="$PIP --no-build-isolation"
     # Build deps required by the Metal packages' setup.py
     $PIP setuptools wheel pybind11
